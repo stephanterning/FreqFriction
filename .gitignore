@@ -1,0 +1,10 @@
+/Ableton recovery*/
+*.als
+*.alc
+*.freqfriction.json
+*.log
+.DS_Store
+.env
+.env.*
+__pycache__/
+*.py[cod]
