@@ -13,9 +13,16 @@ body { margin:0; background:#15171c; color:#d4d9e0; font:11px Arial,sans-serif; 
 #controls { display:flex; align-items:center; gap:4px; position:absolute; left:calc(var(--sidebar) + var(--pane-gap)); top:2px; right:68px; height:21px }
 .compact #controls { left:4px; top:25px; right:4px }
 button, select { font:inherit; color:inherit; border:0 }
-#controls button, select { height:21px; background:#2b3038; padding:0 6px }
+#controls button, #sensitivity button, select { height:21px; background:#2b3038; padding:0 6px }
 #controls button { width:75px; flex-shrink:1; white-space:nowrap; overflow:hidden }
-#controls button.selected { background:#215e5c }
+#controls button.selected, #sensitivity button[aria-pressed=true] { background:#215e5c }
+#sensitivity { position:absolute; right:70px; top:2px; display:flex; align-items:center; gap:4px }
+#sensitivity span { margin-right:3px }
+#controls { right:270px }
+.stacked #controls { right:68px }
+.stacked #sensitivity { top:25px; right:auto; left:calc(var(--sidebar) + var(--pane-gap)) }
+.compact #sensitivity { left:4px; top:48px }
+.compact #controls { right:4px }
 #zoom { position:absolute; top:2px; right:6px; width:56px }
 #status { color:#ffc282 }
 #axis { position:absolute; bottom:8px; left:calc(var(--labels) + var(--pane-gap)); right:10px; height:13px; color:#adb5c2 }
@@ -62,6 +69,7 @@ canvas { flex:1; width:0; min-width:0; height:100%; pointer-events:none }
 <section class="pane" id="sources" aria-label="Sources"></section>
 <section class="pane" id="spectra" aria-label="Spectra"><div id="rows"></div><div id="empty">No visible sources</div></section>
 <div id="controls"><button>Pre FX</button><button>Post FX</button><button>Post Mixer</button><span id="status"></span></div>
+<div id="sensitivity" role="group" aria-label="Sensitivity"><span>Sensitivity</span><button>Low</button><button>Medium</button><button>High</button></div>
 <select aria-label="Interface zoom" id="zoom"><option>75%</option><option selected>100%</option><option>125%</option><option>150%</option><option>175%</option><option>200%</option></select>
 <div id="divider" role="separator" aria-label="Source column width" aria-orientation="vertical"></div>
 </main>

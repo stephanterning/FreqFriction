@@ -203,7 +203,18 @@ function bankChanged() {
     publish();
 }
 
+// Display cutoffs for the same directional masking score. High is the reference detector.
+const sensitivityThresholds = [0.33, 0.23, warningThreshold];
+let sensitivity = 2;
+
 function applyControl(action, value, extra) {
+    if (action === 'sensitivity') {
+        if (Number.isInteger(value) && value >= 0 && value < sensitivityThresholds.length) {
+            sensitivity = value;
+            publish();
+        }
+        return;
+    }
     if (action === 'tap' && Number.isInteger(value) && value >= 0 && value < taps.length) {
         selectedTap = value;
         for (const source of sourceList) {
@@ -335,7 +346,7 @@ function publish() {
     if (!monitor) return;
     const protectedSource = sources.get(reference);
     view = {
-        tap: selectedTap,
+        tap: selectedTap, sensitivity,
         rowHeight: savedRowHeight,
         warningCeilingHz,
         status: bankStatus || selectionWarning || captureWarning || (overCapacity ? overCapacity + ' sources without an input' : ''),
@@ -344,7 +355,7 @@ function publish() {
         rows: sourceList.filter(source => source.shown).map(source => {
             const eligible = source.fresh && protectedSource?.fresh && source.key !== reference && !source.context;
             const spectrum = source.fresh ? Array.from(source.spectrum) : [];
-            const masks = eligible ? Array.from(source.masks) : [];
+            const masks = eligible ? Array.from(source.masks, score => sensitivity === 2 || score >= sensitivityThresholds[sensitivity] ? score : 0) : [];
             return {key: source.key, label: source.label, color: source.color, protectedRow: source.key === reference,
                 context: source.context, status: source.fresh ? '' : source.state || 'Routing…',
                 spectrum, masks};

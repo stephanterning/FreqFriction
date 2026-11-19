@@ -13,12 +13,14 @@ function layout() {
     const width = innerWidth / scale;
     const initial = Math.min(192, Math.floor(width * 0.34));
     const sidebar = Math.max(Math.min(88, initial), Math.min(sidebarWidth ?? initial, Math.max(initial, width - 112)));
-    const compact = width - sidebar < 248;
+    const compact = width - sidebar < 312;
+    const stacked = width - sidebar < 565;
     const labelWidth = Math.min(145, Math.floor((width - sidebar) * 0.34));
     monitor.style.setProperty('--sidebar', sidebar + 'px');
     monitor.style.setProperty('--labels', labelWidth + 'px');
-    monitor.style.setProperty('--header', (compact ? 72 : 48) + 'px');
+    monitor.style.setProperty('--header', (compact ? 96 : stacked ? 72 : 48) + 'px');
     monitor.classList.toggle('compact', compact);
+    monitor.classList.toggle('stacked', stacked);
     const wide = width - sidebar - labelWidth - 10 >= 230;
     const frequencies = wide ? [50, 100, 250, 500, 1000, 2500, 5000, 10000] : [100, 1000, 10000];
     if (ticks.length !== frequencies.length) {
@@ -107,6 +109,8 @@ function frame(payload) {
     setText(byId('helper'), view.helper ? 'Input helper connected' : 'Input helper offline');
     setText(byId('status'), view.status);
     Array.from(byId('controls').querySelectorAll('button')).forEach((button, i) => button.classList.toggle('selected', i === view.tap));
+    byId('sensitivity').querySelectorAll('button').forEach((button, i) =>
+        button.setAttribute('aria-pressed', String(i === view.sensitivity)));
     updateRows(sources, view.tracks, sourceButton, (node, track) => {
         const shown = Boolean(track.shown);
         node.title = track.label;
@@ -284,6 +288,9 @@ rows.onclick = event => {
     }
     send('viewAction', 'reference', row.dataset.key, Number(event.shiftKey));
 };
+byId('sensitivity').querySelectorAll('button').forEach((button, i) => {
+    button.onclick = () => send('viewAction', 'sensitivity', i);
+});
 byId('controls').querySelectorAll('button').forEach((button, i) => {
     button.onclick = () => send('viewAction', 'tap', i);
 });
