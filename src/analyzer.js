@@ -400,7 +400,11 @@ function publish() {
         rows: sourceList.filter(source => source.shown).map(source => {
             const eligible = source.fresh && protectedSource?.fresh && source.key !== reference && !source.context;
             const spectrum = source.fresh ? Array.from(source.spectrum) : [];
-            const masks = eligible ? Array.from(source.masks, (score, b) => hold ? (source.expires[b] > displayTime ? source.held[b] : 0) : (score >= sensitivityThresholds[sensitivity] ? score : 0)) : [];
+            const masks = eligible ? Array.from(source.masks, (score, b) => {
+                if (!hold) return score >= sensitivityThresholds[sensitivity] ? score : 0;
+                const remaining = (source.expires[b] - displayTime) / holdTimes[hold];
+                return source.held[b] * Math.max(0, Math.min(1, remaining));
+            }) : [];
             return {key: source.key, label: source.label, color: source.color, protectedRow: source.key === reference,
                 context: source.context, status: source.fresh ? '' : source.state || 'Routing…',
                 spectrum, masks};
