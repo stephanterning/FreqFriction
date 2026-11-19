@@ -112,7 +112,7 @@ const monitorFrame = new Dict();
 function makeSource(item) {
     return {
         key: sourceKey(item), label: item.display_name, shown: false, context: false,
-        activity: new Float64Array(size), spectrum: new Float32Array(bands).fill(floor),
+        sliceDb: new Float32Array(slices * bands), activity: new Float64Array(size), spectrum: new Float32Array(bands).fill(floor),
         peakPower: 0, lastFrameTime: 0
     };
 }
@@ -286,10 +286,8 @@ function publish() {
             const eligible = source.fresh && protectedSource?.fresh && source.key !== reference && !source.context;
             const overlap = eligible ? temporalOverlap(protectedSource, source) : 0;
             const spectrum = source.fresh ? Array.from(source.spectrum) : [];
-            const masks = overlap >= warningThreshold ? spectrum.map((db, band) => {
-                const score = overlap * risk(protectedSource.spectrum[band], db);
-                return score >= warningThreshold ? score : 0;
-            }) : [];
+            const masks = overlap >= warningThreshold ? spectrum.map((_, band) =>
+                bandRisk(protectedSource, source, band, overlap)) : [];
             return {key: source.key, label: source.label, color: source.color, protectedRow: source.key === reference,
                 context: source.context, status: source.fresh ? '' : source.state || 'Routing…',
                 spectrum, masks};

@@ -4,33 +4,41 @@ const floor = -78;
 const size = 4096;
 const hz = b => 30 * Math.pow(600, b / (bands - 1));
 
-const windowFn = Float64Array.from({length: size}, (_, i) =>
-    0.5 - 0.5 * Math.cos(2 * Math.PI * i / size));
 const activityFloor = Math.pow(10, -65 / 10);
 // Use a decaying peak so the recording level alone does not determine whether a tail counts.
 const relativeActivityFloor = Math.pow(10, -20 / 10);
 const peakReleaseDbPerSecond = 18;
 const warningThreshold = 0.16;
 
-const reversed = new Int32Array(size);
-const cos = new Float64Array(size / 2), sin = new Float64Array(size / 2);
-for (let i = 1; i < size; i++)
-    reversed[i] = (reversed[i >> 1] >> 1) | ((i & 1) * (size >> 1));
-for (let i = 0; i < size / 2; i++) {
-    cos[i] = Math.cos(-2 * Math.PI * i / size);
-    sin[i] = Math.sin(-2 * Math.PI * i / size);
+// Reuse FFT workspaces for the display and the shorter overlap measurements.
+function fftWorkspace(length) {
+    const reversed = new Int32Array(length);
+    const cos = new Float64Array(length / 2), sin = new Float64Array(length / 2);
+    for (let i = 1; i < length; i++)
+        reversed[i] = (reversed[i >> 1] >> 1) | ((i & 1) * (length >> 1));
+    for (let i = 0; i < length / 2; i++) {
+        cos[i] = Math.cos(-2 * Math.PI * i / length);
+        sin[i] = Math.sin(-2 * Math.PI * i / length);
+    }
+    return {length, reversed, cos, sin, real: new Float64Array(length),
+        imag: new Float64Array(length), power: new Float64Array(length / 2),
+        window: Float64Array.from({length}, (_, i) => 0.5 - 0.5 * Math.cos(2 * Math.PI * i / length))};
 }
-const real = new Float64Array(size), imag = new Float64Array(size);
-const power = new Float64Array(size / 2);
 
-function accumulate(input) {
-    for (let i = 0; i < size; i++) real[reversed[i]] = windowFn[i] * input[i];
+const displayFFT = fftWorkspace(size);
+const slices = 7;
+const overlapFFT = fftWorkspace(size / 4);
+const windowFn = displayFFT.window;
+
+function accumulate(fft, input, offset) {
+    const {length, reversed, cos, sin, real, imag, power, window} = fft;
+    for (let i = 0; i < length; i++) real[reversed[i]] = window[i] * input[offset + i];
     imag.fill(0);
-    for (let span = 2; span <= size; span *= 2) {
+    for (let span = 2; span <= length; span *= 2) {
         const half = span / 2;
-        for (let block = 0; block < size; block += span) {
+        for (let block = 0; block < length; block += span) {
             for (let j = 0; j < half; j++) {
-                const a = block + j, b = a + half, w = j * size / span;
+                const a = block + j, b = a + half, w = j * length / span;
                 const r = real[b] * cos[w] - imag[b] * sin[w];
                 const t = real[b] * sin[w] + imag[b] * cos[w];
                 real[b] = real[a] - r; imag[b] = imag[a] - t;
@@ -40,6 +48,24 @@ function accumulate(input) {
     }
     for (let k = 0; k < power.length; k++)
         power[k] += real[k] * real[k] + imag[k] * imag[k];
+}
+
+function measureBands(fft, rate, left, right, offset, output, index) {
+    const {length, power} = fft;
+    power.fill(0);
+    accumulate(fft, left, offset);
+    accumulate(fft, right, offset);
+    if (fft.rate !== rate) {
+        fft.rate = rate;
+        fft.edges = Array.from({length: bands + 1}, (_, b) =>
+            Math.max(1, Math.round(hz(b - 0.5) * length / rate)));
+    }
+    for (let b = 0; b < bands; b++) {
+        const lo = fft.edges[b], hi = Math.min(power.length, Math.max(lo + 1, fft.edges[b + 1]));
+        let peak = 0;
+        for (let k = lo; k < hi; k++) peak = Math.max(peak, power[k]);
+        output[index + b] = Math.max(floor, 10 * Math.log10(1e-12 + peak * 8 / (length * length)));
+    }
 }
 
 function frame(buffer, channel, start, frames) {
@@ -79,16 +105,11 @@ function analyze(source, buffer, phase, now) {
         source.spectrum.fill(floor);
         return true;
     }
-    power.fill(0);
-    accumulate(left);
-    accumulate(right);
-    for (let b = 0; b < bands; b++) {
-        const lo = Math.max(1, Math.round(hz(b - 0.5) * size / rate));
-        const hi = Math.min(power.length, Math.max(lo + 1, Math.round(hz(b + 0.5) * size / rate)));
-        let peak = 0;
-        for (let k = lo; k < hi; k++) peak = Math.max(peak, power[k]);
-        source.spectrum[b] = Math.max(floor, 10 * Math.log10(1e-12 + peak * 8 / (size * size)));
-    }
+    measureBands(displayFFT, rate, left, right, 0, source.spectrum, 0);
+    // Inactive frames cannot enter the overlap comparison.
+    if (source.energy === 0) return true;
+    for (let i = 0; i < slices; i++)
+        measureBands(overlapFFT, rate, left, right, i * overlapFFT.length / 2, source.sliceDb, i * bands);
     return true;
 }
 
@@ -106,3 +127,25 @@ function risk(target, other) {
     return strength(target) * strength(other) * Math.max(0, Math.min(1, (other - target + 18) / 24));
 }
 
+// The long FFT localizes a warning in frequency. Short, aligned windows decide
+// whether both sources actually contributed energy there at the same time.
+function bandRisk(first, second, band, overlap) {
+    const full = risk(first.spectrum[band], second.spectrum[band]);
+    if (full * overlap < warningThreshold) return 0;
+    let targetPeak = floor, otherPeak = floor;
+    for (let i = band; i < slices * bands; i += bands) {
+        targetPeak = Math.max(targetPeak, first.sliceDb[i]);
+        otherPeak = Math.max(otherPeak, second.sliceDb[i]);
+    }
+    let shared = 0, targetEnergy = 0;
+    for (let i = band; i < slices * bands; i += bands) {
+        const target = first.sliceDb[i], other = second.sliceDb[i];
+        const weight = Math.pow(10, (target - targetPeak) / 10);
+        targetEnergy += weight;
+        // Attenuate the tapered edges between two alternating notes.
+        const simultaneous = Math.min(weight, Math.pow(10, (other - otherPeak) / 10));
+        shared += simultaneous * risk(target, other);
+    }
+    const score = Math.min(full * overlap, shared / targetEnergy);
+    return score >= warningThreshold ? score : 0;
+}
