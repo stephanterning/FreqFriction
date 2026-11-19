@@ -58,7 +58,7 @@ def input_bank(patch, helper):
         name = f"{prefix}-{slot}"
         x = 20 + 215 * (slot % 4)
         y = 1240 + 76 * (slot // 4)
-        patch.obj(f"buffer{slot}", f"buffer~ {name} 250 2", x, y)
+        patch.obj(f"buffer{slot}", f"buffer~ {name} 500 2", x, y)
         patch.obj(f"capture{slot}", f"record~ {name} 2 @loop 1", x, y + 28)
         patch.wire("inputs", f"capture{slot}", 2 + 2 * slot)
         patch.wire("inputs", f"capture{slot}", 3 + 2 * slot, 1)
@@ -71,6 +71,12 @@ def input_bank(patch, helper):
     else:
         patch.obj("clock", "qmetro 85", 435, 330, varname="clock")
         patch.wire("clock", "head")
+        patch.obj("engine-state", "dspstate~", 935, 385)
+        patch.obj("engine-rate", "prepend engineRate", 935, 415)
+        patch.wire("inputs", "engine-state")
+        patch.wire("poll", "engine-state")
+        patch.wire("engine-state", "engine-rate", 1)
+        patch.wire("engine-rate", "plot")
     patch.obj("buf-name", f"loadmess buffername {prefix}", 610, 330)
     patch.obj("live-ready", "live.thisdevice", 505, 395)
     patch.obj("init", "deferlow", 505, 425)
@@ -125,7 +131,7 @@ def main_patcher():
     script = ROUTING + (ROOT / "analysis.js").read_text() + (ROOT / "analyzer.js").read_text()
     patch.js("plot", "v8", script, [15, 550, 180, 22], None, BANK_SIZE)
     patch.box("float-button", "live.text", [775, 550, 72, 20], [8, 12, 84, 25],
-              text="Float", texton="Float", mode=1, varname="floatToggle", parameter_enable=1,
+              fontname="Ableton Sans Small", fontface=1, fontsize=10.0, text="Float", texton="Float", mode=1, varname="floatToggle", parameter_enable=1,
               saved_attribute_attributes={"valueof": dict(parameter_longname="Float", parameter_shortname="Float",
                   parameter_type=2, parameter_enum=["Closed", "Open"], parameter_mmax=1,
                   parameter_initial_enable=1, parameter_initial=[0])},
@@ -163,6 +169,7 @@ def helper_patcher():
     patch.js("plot", "v8", ROUTING + (ROOT / "helper.js").read_text(),
              [15, 550, 180, 22], None, BANK_SIZE)
     patch.box("caption", "comment", [15, 15, 212, 38], [9, 12, 206, 38],
+              fontname="Ableton Sans Small", fontface=1, fontsize=10.0,
               text="Adds 31 stereo inputs to the main FreqFriction device.", linecount=2)
     return patch.data([0, 0, 960, 1210], devicewidth=226, latency=0, autosave=0,
                       description="Input helper for FreqFriction")

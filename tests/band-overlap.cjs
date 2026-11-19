@@ -22,16 +22,16 @@ const measure = vm.runInContext(script + `
 // Both tracks sustain the same upper tone. Their low notes either alternate
 // or overlap. Opposite stereo polarity guards against accidentally summing to mono.
 function buffer(rate, sub, early) {
-    const length = 8192;
+    const length = Math.round(rate / 2);
     return {
         channelcount: () => 2, framecount: () => length, length: () => 1000 * length / rate,
         peek(channel, start, count) {
             return Float64Array.from({length: count}, (_, i) => {
-                const n = start + i - (length - 4096 - 256);
+                const n = (start + i - length) * 44100 / rate + 4096 + 256;
                 const onset = sub ? (early ? 700 : 2150) : 0;
                 const end = sub ? 4096 : 1960;
                 const envelope = Math.max(0, Math.min(1, (n - onset) / 120, (end - n) / 120));
-                const phase = 2 * Math.PI * n / rate;
+                const phase = 2 * Math.PI * n / 44100;
                 return (channel === 1 ? 1 : -1) * (0.3 * envelope * Math.sin(70 * phase)
                     + 0.22 * Math.sin(2400 * phase));
             });
@@ -110,3 +110,38 @@ assert(high.some(({masks}) => masks[78] > 0), 'missing 17.2 kHz warning');
 assert(burstRun(96000, 260, 17950).some(({masks}) => masks[79] > 0), 'missing final warning band');
 assert(burstRun(96000, 260, 19500).every(({masks}) => masks.every(v => v === 0)), 'warning above range');
 assert(high.some(({spectrum}) => spectrum.slice(-2).some(v => v > -65)), 'lost upper spectrum');
+
+// At 96 kHz a 300 ms scheduling delay should fit, but a 600 ms gap loses audio.
+const scheduler = vm.runInContext(`(function () {
+    audioCursor = null;
+    captureWarningUntil = 0;
+    const ring = {framecount: () => 48000, length: () => 500};
+    windowLags('main', ring, 0, 1000);
+    const catchup = windowLags('main', ring, 0.6, 1300);
+    const healthy = captureWarningUntil === 0;
+    windowLags('main', ring, 0.8, 1900);
+    windowLags('main', ring, 0.97, 1985);
+    return {healthy, windows: catchup.length, warningUntil: captureWarningUntil};
+})()`, context);
+assert(scheduler.healthy && scheduler.windows === 4);
+assert.equal(scheduler.warningUntil, 3900);
+
+// Compare the same physical tones at the same time, including a switch back.
+let baseline;
+for (const rate of [44100, 48000, 96000, 44100]) {
+    const frames = rate / 2;
+    // A Live audio-engine restart may leave different sample-rate metadata on the buffer.
+    vm.runInContext('engineRate(' + rate + ')', context);
+    function tone(hertz) {
+        return {framecount: () => frames, length: () => frames * 1000 / 44100, channelcount: () => 2,
+            peek(channel, start, count) {
+                return Float64Array.from({length: count}, (_, i) =>
+                    0.25 * Math.sin(2 * Math.PI * hertz * (start + i - frames) / rate));
+            }};
+    }
+    const result = measure(tone(70), tone(95));
+    const counts = [0.33, 0.23, 0.16].map(limit => result.filter(b => b.warning >= limit).length);
+    if (!baseline) baseline = result;
+    assert.deepEqual(counts, [3, 4, 4]);
+    result.forEach((b, i) => assert(Math.abs(b.warning - baseline[i].warning) < 0.002));
+}

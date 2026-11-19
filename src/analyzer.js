@@ -5,13 +5,14 @@ outlets = bankSize;
 const scope = this;
 const sources = new Map();
 let sourceList = [], reference, monitor, view, request = 0;
-let helperAvailable = false, overCapacity = 0, selectedTap = 2;
+let helperAvailable = false, overCapacity = 0;
+const selectedTap = 2;
 let assignmentSignature = '', localFrame, audioCursor;
-let captureWarning = '';
+let captureWarningUntil = 0;
 let monitorRange, savedRowHeight, nextTopologyCheck = 0, selectionWarning = '';
 let song, selectionKey, selectionPath, selections = new Set();
 const buffers = new Map();
-let trackColors = new Map(), colorScan, nextColorScan = 0;
+let trackMetadata = new Map(), colorScan, nextColorScan = 0;
 
 function updateTrackColors(now) {
     if (!song || !monitor) return;
@@ -21,12 +22,12 @@ function updateTrackColors(now) {
         const returns = liveIds(song.get('return_tracks'));
         const master = liveIds(song.get('master_track'));
         colorScan = {ids: [...own, ...returns, ...master], regularCount: own.length, returns,
-            master: master[0], cursor: 0, colors: new Map()};
+            master: master[0], cursor: 0, colors: new Map(), depths: new Map()};
     }
     const scan = colorScan;
-    function add(name, rgb) {
+    function add(name, rgb, depth = 0) {
         if (!scan.colors.has(name)) scan.colors.set(name, []);
-        scan.colors.get(name).push(rgb);
+        scan.colors.get(name).push({rgb, depth});
     }
     for (let n = 0; n < 8 && scan.cursor < scan.ids.length; ++n) {
         const index = scan.cursor++;
@@ -37,7 +38,13 @@ function updateTrackColors(now) {
         const name = Array.isArray(rawName) ? rawName.join(' ') : String(rawName || '');
         const rgb = Number(track.get('color'));
         if (!name || !Number.isInteger(rgb) || rgb < 0 || rgb > 0xffffff) continue;
-        add(name, rgb);
+        let depth = 0;
+        if (index < scan.regularCount && Number(track.get('is_grouped'))) {
+            const parent = liveIds(track.get('group_track'))[0];
+            if (parent) depth = (scan.depths.get(parent) || 0) + 1;
+        }
+        scan.depths.set(id, depth);
+        add(name, rgb, depth);
         const returnIndex = scan.returns.indexOf(id);
         if (returnIndex >= 0) {
             const letter = String.fromCharCode(65 + returnIndex);
@@ -51,7 +58,7 @@ function updateTrackColors(now) {
         }
     }
     if (scan.cursor === scan.ids.length) {
-        trackColors = scan.colors;
+        trackMetadata = scan.colors;
         colorScan = null;
         nextColorScan = now + 1500;
     }
@@ -114,7 +121,7 @@ function makeSource(item) {
     return {
         key: sourceKey(item), label: item.display_name, shown: false, context: false,
         sliceDb: new Float32Array(slices * bands), activity: new Float64Array(size), spectrum: new Float32Array(bands).fill(floor),
-        peakPower: 0, lastFrameTime: 0, masks: new Float32Array(bands)
+        peakPower: 0, lastFrameTime: 0, held: new Float32Array(bands), expires: new Float64Array(bands), masks: new Float32Array(bands)
     };
 }
 
@@ -141,7 +148,9 @@ function updateSources() {
         const occurrence = (occurrences.get(source.label) || 0) + 1;
         occurrences.set(source.label, occurrence);
         source.selection = JSON.stringify([source.label, occurrence]);
-        source.color = trackColors.get(source.label)?.[occurrence - 1] ?? -1;
+        const metadata = trackMetadata.get(source.label)?.[occurrence - 1];
+        source.color = metadata?.rgb ?? -1;
+        source.depth = metadata?.depth ?? 0;
         source.shown = selections.has(source.selection);
         source.item = item;
         return source;
@@ -205,22 +214,29 @@ function bankChanged() {
 
 // Display cutoffs for the same directional masking score. High is the reference detector.
 const sensitivityThresholds = [0.33, 0.23, warningThreshold];
-let sensitivity = 2;
+let sensitivity = 1, hold = 1;
+const holdTimes = [0, 2000, 5000];
 
 function applyControl(action, value, extra) {
+    if (action === 'closeFloat') {
+        if (monitor) scope.patcher.getnamed('floatToggle').message(0);
+        return;
+    }
+    if (action === 'transport') {
+        if (monitor && song) song.call(Number(song.get('is_playing')) ? 'stop_playing' : 'start_playing');
+        return;
+    }
     if (action === 'sensitivity') {
         if (Number.isInteger(value) && value >= 0 && value < sensitivityThresholds.length) {
             sensitivity = value;
+            for (const source of sourceList) source.expires.fill(0);
             publish();
         }
         return;
     }
-    if (action === 'tap' && Number.isInteger(value) && value >= 0 && value < taps.length) {
-        selectedTap = value;
-        for (const source of sourceList) {
-            source.peakPower = 0;
-            source.fresh = false;
-        }
+    if (action === 'hold') {
+        if (!Number.isInteger(value) || value < 0 || value >= holdTimes.length) return;
+        hold = value;
     } else {
         const source = sources.get(String(value));
         if (!source) return;
@@ -234,7 +250,10 @@ function applyControl(action, value, extra) {
             else reference = source.key;
         }
     }
-    for (const source of sourceList) source.masks.fill(0);
+    for (const source of sourceList) {
+        source.masks.fill(0);
+        source.expires.fill(0);
+    }
     updateSources();
     publish();
 }
@@ -255,28 +274,41 @@ function msg_float(phase) {
     } else analyzeFrame();
 }
 
+function engineRate(rate) {
+    if (!(rate > 0) || rate === engineSampleRate) return;
+    engineSampleRate = rate;
+    audioCursor = null;
+    for (const source of sourceList) {
+        source.fresh = false;
+        source.peakPower = 0;
+        source.masks.fill(0);
+        source.expires.fill(0);
+    }
+}
+
 // Keep the analysis grid on the recorded audio when the UI timer jitters.
 function windowLags(bank, buffer, phase, time) {
-    const frames = buffer.framecount(), duration = buffer.length();
-    if (frames <= size + 256 || duration <= 0) return [];
+    const frames = buffer.framecount(), rate = bufferRate(buffer);
+    const duration = frames * 1000 / rate;
+    if (!frames || duration <= 0) return [];
+    const {span, margin, radius, hop} = analysisFormat(rate);
+    const available = frames - span - margin - radius - 1;
+    if (available < 0) return [];
     const head = Math.floor(phase * frames) % frames;
     const previous = audioCursor;
     audioCursor = {bank, frames, duration, head, time, remainder: 0};
-    captureWarning = '';
     if (!previous || previous.bank !== bank || previous.frames !== frames ||
         previous.duration !== duration) return [0];
 
     const advance = (head - previous.head + frames) % frames;
-    const hop = size * 3 / 4;
-    const available = frames - size - 256;
     let pending = advance + previous.remainder;
     // A stalled scheduler can outlive the ring. Resume with resident audio only.
     if (time - previous.time >= duration || pending > available + hop) {
         pending = available;
-        captureWarning = 'Analysis buffer overrun';
+        captureWarningUntil = time + 2000;
     }
     const lags = [];
-    for (let lag = pending - hop; lag >= 0; lag -= hop) lags.push(lag);
+    for (let lag = pending - hop; lag >= 0; lag -= hop) lags.push(Math.round(lag));
     audioCursor.remainder = pending % hop;
     return lags;
 }
@@ -317,7 +349,7 @@ function analyzeFrame() {
     if (ready.length) {
         const clock = ready.find(entry => !entry.source.remote) || ready[0];
         const lags = windowLags(clock.bank, clock.buffer, clock.phase, time);
-        const samplesPerMs = clock.buffer.framecount() / clock.buffer.length();
+        const samplesPerMs = bufferRate(clock.buffer) / 1000;
         const target = sources.get(reference);
         if (lags.length) for (const {source} of ready) source.masks.fill(0);
         for (const lag of lags) {
@@ -335,9 +367,20 @@ function analyzeFrame() {
                     source.masks[b] = Math.max(source.masks[b], bandRisk(target, source, b, overlap));
             }
         }
+        if (hold && lags.length && target?.fresh) {
+            for (const {source} of ready) {
+                if (!source.fresh || source === target || source.context) continue;
+                for (let b = 0; b < warningBandCount; b++) {
+                    const score = source.masks[b];
+                    if (score < sensitivityThresholds[sensitivity]) continue;
+                    source.held[b] = score;
+                    source.expires[b] = now + holdTimes[hold];
+                }
+            }
+        }
     } else {
         audioCursor = null;
-        captureWarning = '';
+        captureWarningUntil = 0;
     }
     publish();
 }
@@ -345,17 +388,19 @@ function analyzeFrame() {
 function publish() {
     if (!monitor) return;
     const protectedSource = sources.get(reference);
+    const displayTime = Date.now();
     view = {
-        tap: selectedTap, sensitivity,
+        hold, sensitivity,
         rowHeight: savedRowHeight,
         warningCeilingHz,
-        status: bankStatus || selectionWarning || captureWarning || (overCapacity ? overCapacity + ' sources without an input' : ''),
+        status: bankStatus || selectionWarning || (displayTime < captureWarningUntil ? 'Analysis skipped some audio' : '') || (overCapacity ? overCapacity + ' sources without an input' : ''),
         helper: helperAvailable,
-        tracks: sourceList.map(({key,label,shown,color}) => ({key,label,shown,color})),
+        exceedsLocalCapacity: sourceList.length > bankSize,
+        tracks: sourceList.map(({key,label,shown,color,depth}) => ({key,label,shown,color,depth})),
         rows: sourceList.filter(source => source.shown).map(source => {
             const eligible = source.fresh && protectedSource?.fresh && source.key !== reference && !source.context;
             const spectrum = source.fresh ? Array.from(source.spectrum) : [];
-            const masks = eligible ? Array.from(source.masks, score => sensitivity === 2 || score >= sensitivityThresholds[sensitivity] ? score : 0) : [];
+            const masks = eligible ? Array.from(source.masks, (score, b) => hold ? (source.expires[b] > displayTime ? source.held[b] : 0) : (score >= sensitivityThresholds[sensitivity] ? score : 0)) : [];
             return {key: source.key, label: source.label, color: source.color, protectedRow: source.key === reference,
                 context: source.context, status: source.fresh ? '' : source.state || 'Routing…',
                 spectrum, masks};
@@ -380,7 +425,7 @@ function monitorClosed() {
     monitor = null;
     monitorRange = null;
     audioCursor = null;
-    captureWarning = '';
+    captureWarningUntil = 0;
     captureRequested = false;
     for (const source of sourceList) source.fresh = false;
     scope.patcher.getnamed('clock').message(0);

@@ -71,23 +71,76 @@ function measureBands(fft, rate, left, right, offset, output, index) {
     }
 }
 
-function frame(buffer, channel, start, frames) {
-    if (start + size <= frames) return buffer.peek(channel, start, size);
-    const count = frames - start;
-    const data = new Float64Array(size);
-    const asArray = x => typeof x === 'number' ? [x] : x;
-    data.set(asArray(buffer.peek(channel, start, count)));
-    data.set(asArray(buffer.peek(channel, 0, size - count)), count);
-    return data;
+// Keep both FFTs on the 44.1 kHz time/frequency grid used for calibration.
+const analysisRate = 44100;
+let lastFormat, engineSampleRate = 0;
+function bufferRate(buffer) {
+    return engineSampleRate || buffer.framecount() * 1000 / buffer.length();
+}
+function analysisFormat(rate) {
+    if (lastFormat?.rate === rate) return lastFormat;
+    const step = rate / analysisRate;
+    const radius = rate === analysisRate ? 0 : Math.ceil(24 * Math.max(1, step));
+    const margin = Math.max(radius, Math.round(256 * step));
+    const span = Math.ceil(size * step);
+    const format = {rate, step, radius, span, margin, hop: size * 0.75 * step};
+    if (radius) {
+        // Cache fractional-delay Hann-windowed sinc kernels. Narrow the cutoff
+        // when downsampling so ultrasonic input cannot fold into the warning bands.
+        const cutoff = Math.min(1, 1 / step);
+        format.offsets = new Int32Array(size);
+        format.kernelAt = new Int32Array(size);
+        format.kernels = Array.from({length: 257}, (_, phase) => {
+            const taps = Float64Array.from({length: radius * 2}, (_, k) => {
+                const x = k - radius + 1 - phase / 256;
+                const sinc = x === 0 ? cutoff : Math.sin(Math.PI * cutoff * x) / (Math.PI * x);
+                return sinc * (0.5 + 0.5 * Math.cos(Math.PI * x / radius));
+            });
+            const sum = taps.reduce((a, b) => a + b, 0);
+            return taps.map(v => v / sum);
+        });
+        for (let i = 0; i < size; i++) {
+            const pos = span - (size - i) * step;
+            format.offsets[i] = Math.floor(pos) + 1;
+            format.kernelAt[i] = Math.round((pos - Math.floor(pos)) * 256);
+        }
+    }
+    return lastFormat = format;
+}
+
+function frame(buffer, channel, start, frames, format) {
+    const {radius, span} = format;
+    const count = span + 2 * radius;
+    const first = Math.min(count, frames - start);
+    let data = buffer.peek(channel, start, first);
+    if (first < count) {
+        const joined = new Float64Array(count);
+        joined.set(first === 1 ? [data] : data);
+        const rest = buffer.peek(channel, 0, count - first);
+        joined.set(count - first === 1 ? [rest] : rest, first);
+        data = joined;
+    }
+    if (!radius) return data;
+    const output = new Float64Array(size);
+    for (let i = 0; i < size; i++) {
+        const offset = format.offsets[i], taps = format.kernels[format.kernelAt[i]];
+        let sum = 0;
+        for (let k = 0; k < taps.length; k++) sum += data[offset + k] * taps[k];
+        output[i] = sum;
+    }
+    return output;
 }
 
 function analyze(source, buffer, phase, now, lag = 0) {
     const frames = buffer.framecount(), length = buffer.length();
-    if (buffer.channelcount() !== 2 || frames <= size + 256 || length <= 0) return false;
-    const rate = frames * 1000 / length;
-    const start = (frames + Math.floor(phase * frames) - size - 256 - lag) % frames;
-    const left = frame(buffer, 1, start, frames);
-    const right = frame(buffer, 2, start, frames);
+    if (buffer.channelcount() !== 2 || !frames || length <= 0) return false;
+    const format = analysisFormat(bufferRate(buffer));
+    const history = format.span + format.margin + format.radius;
+    if (frames <= history + lag) return false;
+    const start = (frames + Math.floor(phase * frames) - history - lag) % frames;
+    const left = frame(buffer, 1, start, frames, format);
+    const right = frame(buffer, 2, start, frames, format);
+    const rate = analysisRate;
     const samplePower = source.activity;
     let framePeak = 0;
     for (let n = 0; n < size; n++) {

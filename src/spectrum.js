@@ -56,6 +56,8 @@ function spectrumRow() {
     node.className = 'row';
     node.innerHTML = '<div class="row-label"><button class="fold" type="button"></button>' +
         '<button class="track-name" type="button"><span class="name ellipsis"></span>' +
+        '<svg class="shield" viewBox="0 0 16 16" role="img" aria-label="Protected">' +
+        '<title>Protected</title><path d="M8 1.5 14 4v4c0 3-2.5 5.2-6 7-3.5-1.8-6-4-6-7V4z"/></svg>' +
         '<span class="detail ellipsis"></span></button></div><canvas></canvas>';
     return node;
 }
@@ -106,14 +108,16 @@ function frame(payload) {
     view = next;
     const protectedKey = view.rows.find(row => row.protectedRow)?.key;
     setText(byId('count'), 'Sources  ' + view.rows.length + '/' + view.tracks.length);
-    setText(byId('helper'), view.helper ? 'Input helper connected' : 'Input helper offline');
+    setText(byId('helper'), view.helper ? 'Input helper connected' : view.exceedsLocalCapacity ? 'Input helper offline' : '');
     setText(byId('status'), view.status);
-    Array.from(byId('controls').querySelectorAll('button')).forEach((button, i) => button.classList.toggle('selected', i === view.tap));
+    Array.from(byId('controls').querySelectorAll('button')).forEach((button, i) => button.classList.toggle('selected', i === view.hold));
     byId('sensitivity').querySelectorAll('button').forEach((button, i) =>
         button.setAttribute('aria-pressed', String(i === view.sensitivity)));
     updateRows(sources, view.tracks, sourceButton, (node, track) => {
         const shown = Boolean(track.shown);
         node.title = track.label;
+        const padding = (8 + 12 * track.depth) + 'px';
+        if (node.style.paddingLeft !== padding) node.style.paddingLeft = padding;
         node.setAttribute('aria-pressed', shown);
         node.classList.toggle('protected', track.key === protectedKey);
         setTrackLabelColor(node, track.color);
@@ -131,7 +135,7 @@ function frame(payload) {
         updateFold(node);
         setTrackLabelColor(label, row.color);
         setText(name.firstChild, row.label);
-        setText(name.lastChild, row.status || (row.protectedRow ? 'Protected' : row.context ? 'Context' : ''));
+        setText(name.lastChild, row.status || (row.context && !row.protectedRow ? 'Context' : ''));
     });
     byId('empty').hidden = !!view.rows.length;
     schedulePlot();
@@ -292,7 +296,7 @@ byId('sensitivity').querySelectorAll('button').forEach((button, i) => {
     button.onclick = () => send('viewAction', 'sensitivity', i);
 });
 byId('controls').querySelectorAll('button').forEach((button, i) => {
-    button.onclick = () => send('viewAction', 'tap', i);
+    button.onclick = () => send('viewAction', 'hold', i);
 });
 zoom.onchange = () => {
     scale = parseInt(zoom.value, 10) / 100;
@@ -313,6 +317,15 @@ divider.onlostpointercapture = () => {
     dragOffset = undefined;
     divider.classList.remove('drag');
 };
+addEventListener('keydown', event => {
+    if (!active || event.defaultPrevented || event.isComposing ||
+        event.metaKey || event.ctrlKey || event.altKey || event.shiftKey) return;
+    if (event.key !== 'Escape' && event.code !== 'Space') return;
+    // Let the native zoom picker dismiss itself or accept its selection.
+    if (CSS.supports('selector(select:open)') && zoom.matches(':open')) return;
+    event.preventDefault();
+    if (!event.repeat) send('viewAction', event.key === 'Escape' ? 'closeFloat' : 'transport', 0);
+});
 addEventListener('resize', layout);
 bridge.bindInlet('frame', frame);
 bridge.bindInlet('opened', () => {active = true; previousRange = ''; layout();});
