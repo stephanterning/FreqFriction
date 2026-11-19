@@ -3,12 +3,22 @@ import base64
 import json
 from pathlib import Path
 import struct
+import subprocess
+import sys
 
 ROOT = Path(__file__).resolve().parent
 APP_VERSION = dict(major=9, minor=0, revision=0, architecture="x64", modernui=1)
 BANK_SIZE = 31
 ROUTING = (ROOT / "routing.js").read_text()
 
+
+# Rebuild the portable kernels with: python3 src/build.py --dsp /path/to/zig
+# Normal device builds embed the checked-in module and need only Python.
+if len(sys.argv) == 3 and sys.argv[1] == "--dsp":
+    subprocess.run([sys.argv[2], "cc", "-target", "wasm32-freestanding", "-O3",
+                    "-nostdlib", "-ffp-contract=off", "-Wl,--no-entry", "-Wl,--strip-all",
+                    "-Wl,--export=resample", "-Wl,--export=fftpower", "-Wl,--export=__heap_base",
+                    "dsp.c", "-o", "dsp.wasm"], cwd=ROOT, check=True)
 
 class Patcher:
     def __init__(self):
@@ -128,7 +138,8 @@ def window():
 def main_patcher():
     patch = Patcher()
     input_bank(patch, helper=False)
-    script = ROUTING + (ROOT / "analysis.js").read_text() + (ROOT / "analyzer.js").read_text()
+    kernels = json.dumps(list((ROOT / "dsp.wasm").read_bytes()), separators=(",", ":"))
+    script = ROUTING + "const kernelBytes = " + kernels + ";\n" + (ROOT / "analysis.js").read_text() + (ROOT / "analyzer.js").read_text()
     patch.js("plot", "v8", script, [15, 550, 180, 22], None, BANK_SIZE)
     patch.box("float-button", "live.text", [775, 550, 72, 20], [8, 12, 84, 25],
               fontname="Ableton Sans Small", fontface=1, fontsize=10.0, text="Float", texton="Float", mode=1, varname="floatToggle", parameter_enable=1,

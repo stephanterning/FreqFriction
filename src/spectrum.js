@@ -105,6 +105,10 @@ function setTrackLabelColor(node, rgb) {
 function frame(payload) {
     const next = JSON.parse(payload);
     if (!view && Number.isFinite(next.rowHeight)) setHeight(next.rowHeight);
+    for (const row of next.rows) {
+        row.spectrum = [];
+        row.masks = [];
+    }
     view = next;
     const protectedKey = view.rows.find(row => row.protectedRow)?.key;
     setText(byId('count'), 'Sources  ' + view.rows.length + '/' + view.tracks.length);
@@ -138,6 +142,21 @@ function frame(payload) {
         setText(name.lastChild, row.status || (row.context && !row.protectedRow ? 'Context' : ''));
     });
     byId('empty').hidden = !!view.rows.length;
+    schedulePlot();
+}
+
+function updateSpectra(first, ...values) {
+    if (!active || !view) return;
+    let offset = 0;
+    for (let i = first; i < view.rows.length && offset < values.length; i++) {
+        const row = view.rows[i];
+        const bins = values[offset++], masks = values[offset++];
+        if (offset + bins + masks > values.length || !Number.isInteger(bins) || !Number.isInteger(masks)) return;
+        row.spectrum = values.slice(offset, offset + bins);
+        offset += bins;
+        row.masks = values.slice(offset, offset + masks);
+        offset += masks;
+    }
     schedulePlot();
 }
 
@@ -328,6 +347,7 @@ addEventListener('keydown', event => {
 });
 addEventListener('resize', layout);
 bridge.bindInlet('frame', frame);
+bridge.bindInlet('spectra', updateSpectra);
 bridge.bindInlet('opened', () => {active = true; previousRange = ''; layout();});
 bridge.bindInlet('closed', () => {active = false;});
 layout();

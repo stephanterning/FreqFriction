@@ -12,7 +12,7 @@ let captureWarningUntil = 0;
 let monitorRange, savedRowHeight, nextTopologyCheck = 0, selectionWarning = '';
 let song, selectionKey, selectionPath, selections = new Set();
 const buffers = new Map();
-let trackMetadata = new Map(), colorScan, nextColorScan = 0;
+let trackMetadata = new Map(), trackHandles = new Map(), colorScan, nextColorScan = 0;
 
 function updateTrackColors(now) {
     if (!song || !monitor) return;
@@ -22,7 +22,7 @@ function updateTrackColors(now) {
         const returns = liveIds(song.get('return_tracks'));
         const master = liveIds(song.get('master_track'));
         colorScan = {ids: [...own, ...returns, ...master], regularCount: own.length, returns,
-            master: master[0], cursor: 0, colors: new Map(), depths: new Map()};
+            master: master[0], cursor: 0, colors: new Map(), depths: new Map(), handles: new Map()};
     }
     const scan = colorScan;
     function add(name, rgb, depth = 0) {
@@ -32,7 +32,8 @@ function updateTrackColors(now) {
     for (let n = 0; n < 8 && scan.cursor < scan.ids.length; ++n) {
         const index = scan.cursor++;
         const id = scan.ids[index];
-        const track = new LiveAPI(null, 'id ' + id);
+        const track = trackHandles.get(id) || new LiveAPI(null, 'id ' + id);
+        scan.handles.set(id, track);
         if (index < scan.regularCount && !Number(track.get('has_audio_output'))) continue;
         const rawName = track.get('name');
         const name = Array.isArray(rawName) ? rawName.join(' ') : String(rawName || '');
@@ -59,6 +60,7 @@ function updateTrackColors(now) {
     }
     if (scan.cursor === scan.ids.length) {
         trackMetadata = scan.colors;
+        trackHandles = scan.handles;
         colorScan = null;
         nextColorScan = now + 1500;
     }
@@ -116,6 +118,7 @@ function stereoBuffer(prefix, slot) {
 }
 const renderFrame = new Task(analyzeFrame, this);
 const monitorFrame = new Dict();
+let layoutSignature = '';
 
 function makeSource(item) {
     return {
@@ -410,13 +413,32 @@ function publish() {
                 spectrum, masks};
         })
     };
-    monitorFrame.parse(JSON.stringify(view));
-    monitor.getnamed('plot').message('drawFrame', monitorFrame.name);
+    // Keep continuously changing numbers out of Max's permanent symbol table.
+    // Only send labels, routing status and layout when they actually change.
+    const layout = JSON.stringify({...view, rows: view.rows.map(({spectrum, masks, ...row}) => row)});
+    const plot = monitor.getnamed('plot');
+    if (layout !== layoutSignature) {
+        layoutSignature = layout;
+        monitorFrame.parse(layout);
+        plot.message('drawFrame', monitorFrame.name);
+    }
+    if (!monitorRange || !view.rows.length) {
+        plot.message('drawSpectra', 0);
+        return;
+    }
+    // Bound the length of each Max message even if both input banks are visible.
+    for (let first = 0; first < view.rows.length; first += 5) {
+        const values = [];
+        for (const {spectrum, masks} of view.rows.slice(first, first + 5))
+            values.push(spectrum.length, masks.length, ...spectrum, ...masks);
+        plot.message('drawSpectra', first, ...values);
+    }
 }
 
 function monitorOpened() {
     if (!Number(scope.patcher.getnamed('floatToggle').getvalueof())) return;
     monitor = scope.patcher.getnamed('monitor').subpatcher();
+    layoutSignature = '';
     captureRequested = true;
     scope.patcher.getnamed('clock').message(1);
     updateSources();

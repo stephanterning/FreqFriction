@@ -7,7 +7,7 @@ const device = fs.readFileSync(path.join(__dirname, '..', 'FreqFriction.amxd'));
 const patch = JSON.parse(device.subarray(32, -1));
 const script = patch.patcher.boxes.find(({box}) => box.id === 'plot').box.textfile.text;
 const context = vm.createContext({Dict: function () {}, Task: function () {}});
-const measure = vm.runInContext(script + `
+const measureSource = script + `
     (function (bufferA, bufferB) {
         const a = makeSource({identifier: 1}), b = makeSource({identifier: 2});
         analyze(a, bufferA, 0, 1000);
@@ -17,7 +17,12 @@ const measure = vm.runInContext(script + `
             hz: hz(band), old: risk(a.spectrum[band], b.spectrum[band]) * overlap,
             warning: bandRisk(a, b, band, overlap)
         }));
-    })`, context);
+    })`;
+const measure = vm.runInContext(measureSource, context);
+const fallback = vm.createContext({Dict: function () {}, Task: function () {}, WebAssembly: undefined});
+const measureFallback = vm.runInContext(measureSource, fallback);
+assert(vm.runInContext('!!displayFFT.exports && !!overlapFFT.exports', context));
+assert(vm.runInContext('!displayFFT.exports && !overlapFFT.exports', fallback));
 
 // Both tracks sustain the same upper tone. Their low notes either alternate
 // or overlap. Opposite stereo polarity guards against accidentally summing to mono.
@@ -42,6 +47,10 @@ function buffer(rate, sub, early) {
 for (const rate of [44100, 48000, 96000]) {
     for (const early of [false, true]) {
         const values = measure(buffer(rate, false, early), buffer(rate, true, early));
+        // Compare all 80 bands across VM realms, including subthreshold scores
+        // and the final warning, with and without the compiled DSP kernels.
+        const expected = measureFallback(buffer(rate, false, early), buffer(rate, true, early));
+        assert.equal(JSON.stringify(values), JSON.stringify(expected));
         const low = values.filter(v => v.hz > 55 && v.hz < 90);
         assert(low.some(v => v.old >= 0.16), 'fixture must reproduce the broadband false positive');
         assert.equal(low.some(v => v.warning > 0), early, 'sub warning at ' + rate);

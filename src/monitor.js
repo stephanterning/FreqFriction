@@ -39,6 +39,11 @@ function drawFrame(name) {
     if (active && ready) browser.message('frame', frameDict.stringify());
 }
 
+function drawSpectra(first, ...values) {
+    if (first === 0) fitWindow();
+    if (active && ready) browser.message('spectra', first, ...values);
+}
+
 function windowClosed() {
     active = false;
     if (ready) browser.message('closed');

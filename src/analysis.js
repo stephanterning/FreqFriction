@@ -13,15 +13,58 @@ const relativeActivityFloor = Math.pow(10, -20 / 10);
 const peakReleaseDbPerSecond = 18;
 const warningThreshold = 0.16;
 
+// Max runs this callback on Live's UI thread. Cross into compiled code once
+// per transform or resampling block, never once per sample.
+function loadDSP() {
+    if (typeof WebAssembly !== 'object') return null;
+    try {
+        return new WebAssembly.Module(new Uint8Array(kernelBytes));
+    } catch {
+        // Some hosts expose WebAssembly but disable dynamic compilation.
+        return null;
+    }
+}
+const dspModule = loadDSP();
+
+function dspWorkspace(layout) {
+    if (!dspModule) return null;
+    const {exports} = new WebAssembly.Instance(dspModule);
+    let end = exports.__heap_base.value;
+    const offsets = {};
+    for (const [name, type, count] of layout) {
+        end = Math.ceil(end / 8) * 8;
+        offsets[name] = end;
+        end += type.BYTES_PER_ELEMENT * count;
+    }
+    const extra = end - exports.memory.buffer.byteLength;
+    if (extra > 0) exports.memory.grow(Math.ceil(extra / 65536));
+    const result = {exports};
+    for (const [name, type, count] of layout)
+        result[name] = new type(exports.memory.buffer, offsets[name], count);
+    return result;
+}
+
 // Reuse FFT workspaces for the display and the shorter overlap measurements.
 function fftWorkspace(length) {
-    const reversed = new Int32Array(length);
-    const cos = new Float64Array(length / 2), sin = new Float64Array(length / 2);
+    const native = dspWorkspace([
+        ['input', Float64Array, length], ['window', Float64Array, length],
+        ['reversed', Int32Array, length], ['cos', Float64Array, length / 2],
+        ['sin', Float64Array, length / 2], ['real', Float64Array, length],
+        ['imag', Float64Array, length], ['power', Float64Array, length / 2]
+    ]);
+    const reversed = native?.reversed ?? new Int32Array(length);
+    const cos = native?.cos ?? new Float64Array(length / 2);
+    const sin = native?.sin ?? new Float64Array(length / 2);
     for (let i = 1; i < length; i++)
         reversed[i] = (reversed[i >> 1] >> 1) | ((i & 1) * (length >> 1));
     for (let i = 0; i < length / 2; i++) {
         cos[i] = Math.cos(-2 * Math.PI * i / length);
         sin[i] = Math.sin(-2 * Math.PI * i / length);
+    }
+    if (native) {
+        for (let i = 0; i < length; i++)
+            native.window[i] = 0.5 - 0.5 * Math.cos(2 * Math.PI * i / length);
+        return {...native, length};
     }
     return {length, reversed, cos, sin, real: new Float64Array(length),
         imag: new Float64Array(length), power: new Float64Array(length / 2),
@@ -35,6 +78,12 @@ const windowFn = displayFFT.window;
 
 function accumulate(fft, input, offset) {
     const {length, reversed, cos, sin, real, imag, power, window} = fft;
+    if (fft.exports) {
+        fft.input.set(input.subarray(offset, offset + length));
+        fft.exports.fftpower(fft.input.byteOffset, window.byteOffset, reversed.byteOffset,
+            cos.byteOffset, sin.byteOffset, real.byteOffset, imag.byteOffset, power.byteOffset, length);
+        return;
+    }
     for (let i = 0; i < length; i++) real[reversed[i]] = window[i] * input[offset + i];
     imag.fill(0);
     for (let span = 2; span <= length; span *= 2) {
@@ -104,6 +153,18 @@ function analysisFormat(rate) {
             format.offsets[i] = Math.floor(pos) + 1;
             format.kernelAt[i] = Math.round((pos - Math.floor(pos)) * 256);
         }
+        const taps = radius * 2;
+        const native = dspWorkspace([
+            ['input', Float64Array, span + taps], ['output', Float64Array, size],
+            ['kernels', Float64Array, taps * format.kernels.length],
+            ['offsets', Int32Array, size], ['phase', Int32Array, size]
+        ]);
+        if (native) {
+            native.offsets.set(format.offsets);
+            native.phase.set(format.kernelAt);
+            format.kernels.forEach((kernel, i) => native.kernels.set(kernel, i * taps));
+            format.native = native;
+        }
     }
     return lastFormat = format;
 }
@@ -120,7 +181,15 @@ function frame(buffer, channel, start, frames, format) {
         joined.set(count - first === 1 ? [rest] : rest, first);
         data = joined;
     }
-    if (!radius) return data;
+    if (!radius) return ArrayBuffer.isView(data) ? data : Float64Array.from(data);
+    const native = format.native;
+    if (native) {
+        native.input.set(data);
+        native.exports.resample(native.input.byteOffset, native.kernels.byteOffset,
+            native.offsets.byteOffset, native.phase.byteOffset, native.output.byteOffset, size, radius * 2);
+        // Both stereo channels must remain available until the FFTs have finished.
+        return native.output.slice();
+    }
     const output = new Float64Array(size);
     for (let i = 0; i < size; i++) {
         const offset = format.offsets[i], taps = format.kernels[format.kernelAt[i]];
