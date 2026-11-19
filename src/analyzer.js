@@ -355,6 +355,7 @@ function publish() {
 }
 
 function monitorOpened() {
+    if (!Number(scope.patcher.getnamed('floatToggle').getvalueof())) return;
     monitor = scope.patcher.getnamed('monitor').subpatcher();
     captureRequested = true;
     scope.patcher.getnamed('clock').message(1);
@@ -364,6 +365,7 @@ function monitorOpened() {
     publish();
 }
 function monitorClosed() {
+    scope.patcher.getnamed('floatToggle').message('set', 0);
     monitor = null;
     monitorRange = null;
     audioCursor = null;

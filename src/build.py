@@ -124,9 +124,12 @@ def main_patcher():
     input_bank(patch, helper=False)
     script = ROUTING + (ROOT / "analysis.js").read_text() + (ROOT / "analyzer.js").read_text()
     patch.js("plot", "v8", script, [15, 550, 180, 22], None, BANK_SIZE)
-    patch.box("float-button", "textbutton", [775, 550, 72, 20], [8, 12, 84, 25],
-              text="Float", mode=0, parameter_enable=0,
-              annotation="Open the floating FreqFriction window in Live")
+    patch.box("float-button", "live.text", [775, 550, 72, 20], [8, 12, 84, 25],
+              text="Float", texton="Float", mode=1, varname="floatToggle", parameter_enable=1,
+              saved_attribute_attributes={"valueof": dict(parameter_longname="Float", parameter_shortname="Float",
+                  parameter_type=2, parameter_enum=["Closed", "Open"], parameter_mmax=1,
+                  parameter_initial_enable=1, parameter_initial=[0])},
+              annotation="Show or hide the floating FreqFriction window")
     patch.box("monitor", "newobj", [750, 675, 120, 22], text="p FreqFriction", varname="monitor",
               numinlets=1, numoutlets=1, outlettype=[""], patcher=window())
     patch.obj("window-trigger", "t b b b", 570, 665)
@@ -135,7 +138,12 @@ def main_patcher():
     patch.obj("window-defer", "deferlow", 570, 705)
     patch.message("window-style", "title FreqFriction, window flags float grow, window exec", 570, 770)
     patch.message("window-sync", "monitorOpened", 570, 810)
-    patch.wire("float-button", "window-trigger", 1)
+    patch.obj("window-select", "sel 1 0", 775, 590)
+    patch.message("window-close", "close", 820, 705)
+    patch.wire("float-button", "window-select")
+    patch.wire("window-select", "window-trigger")
+    patch.wire("window-select", "window-close", 1)
+    patch.wire("window-close", "window-control")
     patch.wire("window-trigger", "window-open", 1)
     patch.wire("window-open", "window-control")
     patch.wire("window-control", "monitor")
@@ -145,7 +153,7 @@ def main_patcher():
     patch.wire("window-defer", "window-sync")
     patch.wire("window-sync", "plot")
     patch.wire("monitor", "plot")
-    return patch.data([0, 0, 960, 1210], devicewidth=100, latency=0, autosave=0,
+    return patch.data([0, 0, 960, 1210], parameters={"float-button": ["Float", "Float", 0]}, devicewidth=100, latency=0, autosave=0,
                       description="Multitrack spectral masking monitor")
 
 
