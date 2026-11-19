@@ -6,7 +6,8 @@ const scope = this;
 const sources = new Map();
 let sourceList = [], reference, monitor, view, request = 0;
 let helperAvailable = false, overCapacity = 0, selectedTap = 2;
-let assignmentSignature = '', localFrame;
+let assignmentSignature = '', localFrame, audioCursor;
+let captureWarning = '';
 let monitorRange, savedRowHeight, nextTopologyCheck = 0, selectionWarning = '';
 let song, selectionKey, selectionPath, selections = new Set();
 const buffers = new Map();
@@ -113,7 +114,7 @@ function makeSource(item) {
     return {
         key: sourceKey(item), label: item.display_name, shown: false, context: false,
         sliceDb: new Float32Array(slices * bands), activity: new Float64Array(size), spectrum: new Float32Array(bands).fill(floor),
-        peakPower: 0, lastFrameTime: 0
+        peakPower: 0, lastFrameTime: 0, masks: new Float32Array(bands)
     };
 }
 
@@ -222,6 +223,7 @@ function applyControl(action, value, extra) {
             else reference = source.key;
         }
     }
+    for (const source of sourceList) source.masks.fill(0);
     updateSources();
     publish();
 }
@@ -242,6 +244,32 @@ function msg_float(phase) {
     } else analyzeFrame();
 }
 
+// Keep the analysis grid on the recorded audio when the UI timer jitters.
+function windowLags(bank, buffer, phase, time) {
+    const frames = buffer.framecount(), duration = buffer.length();
+    if (frames <= size + 256 || duration <= 0) return [];
+    const head = Math.floor(phase * frames) % frames;
+    const previous = audioCursor;
+    audioCursor = {bank, frames, duration, head, time, remainder: 0};
+    captureWarning = '';
+    if (!previous || previous.bank !== bank || previous.frames !== frames ||
+        previous.duration !== duration) return [0];
+
+    const advance = (head - previous.head + frames) % frames;
+    const hop = size * 3 / 4;
+    const available = frames - size - 256;
+    let pending = advance + previous.remainder;
+    // A stalled scheduler can outlive the ring. Resume with resident audio only.
+    if (time - previous.time >= duration || pending > available + hop) {
+        pending = available;
+        captureWarning = 'Analysis buffer overrun';
+    }
+    const lags = [];
+    for (let lag = pending - hop; lag >= 0; lag -= hop) lags.push(lag);
+    audioCursor.remainder = pending % hop;
+    return lags;
+}
+
 function analyzeFrame() {
     if (!monitor || !localFrame) return;
     const {phase, time, helper, sequence, analyzing} = localFrame;
@@ -255,6 +283,7 @@ function analyzeFrame() {
     }
     const now = Date.now();
     const localStates = slotStates();
+    const ready = [];
     for (const source of sourceList) {
         const state = source.slot < 0 ? null :
             (source.remote ? helper?.slots : localStates)?.[source.slot];
@@ -263,12 +292,41 @@ function analyzeFrame() {
             state?.wanted === wanted ? state.state : 'Routing…';
         const hasFrame = source.remote ? Number.isFinite(remotePhase) :
             recording && now - recordingStartedAt >= 150;
-        source.fresh = analyzing.has(source) && hasFrame && state?.wanted === wanted &&
-            state.state === 'Ready' && now >= state.readyAt &&
-            analyze(source, stereoBuffer(source.remote ? helper.buffer : bufferName, source.slot),
-                source.remote ? remotePhase : phase, now);
-        if (analyzing.has(source) && !source.fresh && source.state === 'Ready')
-            source.state = hasFrame ? 'Waiting for audio' : 'Waiting for helper audio';
+        if (analyzing.has(source) && hasFrame && state?.wanted === wanted &&
+                state.state === 'Ready' && now >= state.readyAt) {
+            const bank = source.remote ? helper.buffer : bufferName;
+            ready.push({source, bank, buffer: stereoBuffer(bank, source.slot),
+                phase: source.remote ? remotePhase : phase, readyAt: state.readyAt});
+        } else {
+            source.fresh = false;
+            if (analyzing.has(source) && source.state === 'Ready')
+                source.state = hasFrame ? 'Waiting for audio' : 'Waiting for helper audio';
+        }
+    }
+    if (ready.length) {
+        const clock = ready.find(entry => !entry.source.remote) || ready[0];
+        const lags = windowLags(clock.bank, clock.buffer, clock.phase, time);
+        const samplesPerMs = clock.buffer.framecount() / clock.buffer.length();
+        const target = sources.get(reference);
+        if (lags.length) for (const {source} of ready) source.masks.fill(0);
+        for (const lag of lags) {
+            const frameTime = time - lag / samplesPerMs;
+            for (const entry of ready) {
+                entry.source.fresh = frameTime >= entry.readyAt &&
+                    analyze(entry.source, entry.buffer, entry.phase, frameTime, lag);
+            }
+            if (!target?.fresh) continue;
+            for (const {source} of ready) {
+                if (!source.fresh || source === target || source.context) continue;
+                const overlap = temporalOverlap(target, source);
+                if (overlap < warningThreshold) continue;
+                for (let b = 0; b < warningBandCount; b++)
+                    source.masks[b] = Math.max(source.masks[b], bandRisk(target, source, b, overlap));
+            }
+        }
+    } else {
+        audioCursor = null;
+        captureWarning = '';
     }
     publish();
 }
@@ -279,15 +337,14 @@ function publish() {
     view = {
         tap: selectedTap,
         rowHeight: savedRowHeight,
-        status: bankStatus || selectionWarning || (overCapacity ? overCapacity + ' sources without an input' : ''),
+        warningCeilingHz,
+        status: bankStatus || selectionWarning || captureWarning || (overCapacity ? overCapacity + ' sources without an input' : ''),
         helper: helperAvailable,
         tracks: sourceList.map(({key,label,shown,color}) => ({key,label,shown,color})),
         rows: sourceList.filter(source => source.shown).map(source => {
             const eligible = source.fresh && protectedSource?.fresh && source.key !== reference && !source.context;
-            const overlap = eligible ? temporalOverlap(protectedSource, source) : 0;
             const spectrum = source.fresh ? Array.from(source.spectrum) : [];
-            const masks = overlap >= warningThreshold ? spectrum.map((_, band) =>
-                bandRisk(protectedSource, source, band, overlap)) : [];
+            const masks = eligible ? Array.from(source.masks) : [];
             return {key: source.key, label: source.label, color: source.color, protectedRow: source.key === reference,
                 context: source.context, status: source.fresh ? '' : source.state || 'Routing…',
                 spectrum, masks};
@@ -309,6 +366,8 @@ function monitorOpened() {
 function monitorClosed() {
     monitor = null;
     monitorRange = null;
+    audioCursor = null;
+    captureWarning = '';
     captureRequested = false;
     for (const source of sourceList) source.fresh = false;
     scope.patcher.getnamed('clock').message(0);

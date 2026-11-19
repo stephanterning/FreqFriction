@@ -1,8 +1,11 @@
 // Shared time-domain and spectral analysis for both input banks.
 const bands = 80;
+const warningCeilingHz = 18000;
 const floor = -78;
 const size = 4096;
 const hz = b => 30 * Math.pow(600, b / (bands - 1));
+
+const warningBandCount = 1 + Math.floor((bands - 1) * Math.log(warningCeilingHz / 30) / Math.log(600));
 
 const activityFloor = Math.pow(10, -65 / 10);
 // Use a decaying peak so the recording level alone does not determine whether a tail counts.
@@ -58,7 +61,7 @@ function measureBands(fft, rate, left, right, offset, output, index) {
     if (fft.rate !== rate) {
         fft.rate = rate;
         fft.edges = Array.from({length: bands + 1}, (_, b) =>
-            Math.max(1, Math.round(hz(b - 0.5) * length / rate)));
+            Math.max(1, (b === bands ? Math.floor(warningCeilingHz * length / rate) + 1 : Math.round(hz(b - 0.5) * length / rate))));
     }
     for (let b = 0; b < bands; b++) {
         const lo = fft.edges[b], hi = Math.min(power.length, Math.max(lo + 1, fft.edges[b + 1]));
@@ -78,11 +81,11 @@ function frame(buffer, channel, start, frames) {
     return data;
 }
 
-function analyze(source, buffer, phase, now) {
+function analyze(source, buffer, phase, now, lag = 0) {
     const frames = buffer.framecount(), length = buffer.length();
     if (buffer.channelcount() !== 2 || frames <= size + 256 || length <= 0) return false;
     const rate = frames * 1000 / length;
-    const start = (frames + Math.floor(phase * frames) - size - 256) % frames;
+    const start = (frames + Math.floor(phase * frames) - size - 256 - lag) % frames;
     const left = frame(buffer, 1, start, frames);
     const right = frame(buffer, 2, start, frames);
     const samplePower = source.activity;
@@ -130,6 +133,7 @@ function risk(target, other) {
 // The long FFT localizes a warning in frequency. Short, aligned windows decide
 // whether both sources actually contributed energy there at the same time.
 function bandRisk(first, second, band, overlap) {
+    if (band >= warningBandCount) return 0;
     const full = risk(first.spectrum[band], second.spectrum[band]);
     if (full * overlap < warningThreshold) return 0;
     let targetPeak = floor, otherPeak = floor;

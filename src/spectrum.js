@@ -192,10 +192,12 @@ function paintCurve(canvas, row) {
     ctx.fillStyle = 'rgba(255,255,255,.08)';
     for (const tick of ticks) ctx.fillRect(tick * width, 0, 1, height);
     const bandWidth = width / Math.max(1, row.spectrum.length - 1);
+    const warningRight = width * Math.log(view.warningCeilingHz / 30) / Math.log(600);
     row.masks.forEach((amount, i) => {
         if (!amount) return;
         ctx.fillStyle = 'rgba(255,46,46,' + 0.58 * amount + ')';
-        ctx.fillRect(i * bandWidth, 0, bandWidth + 0.2, height);
+        const x = Math.max(0, (i - 0.5) * bandWidth);
+        if (x < warningRight) ctx.fillRect(x, 0, Math.min(bandWidth + 0.2, warningRight - x), height);
     });
     ctx.lineWidth = row.protectedRow ? 1.7 : 1.15;
     ctx.strokeStyle = trackColorHex(row.color) || '#cad4e3';
