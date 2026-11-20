@@ -13,9 +13,11 @@ const measureSource = script + `
         analyze(a, bufferA, 0, 1000);
         analyze(b, bufferB, 0, 1000);
         const overlap = temporalOverlap(a, b);
+        const coincidence = bassCoincidence(a, b);
         return Array.from(a.spectrum, (_, band) => ({
             hz: hz(band), old: risk(a.spectrum[band], b.spectrum[band]) * overlap,
-            warning: bandRisk(a, b, band, overlap)
+            reference: referenceBandRisk(a, b, band, overlap),
+            warning: bandRisk(a, b, band, overlap, coincidence)
         }));
     })`;
 const measure = vm.runInContext(measureSource, context);
@@ -57,6 +59,83 @@ for (const rate of [44100, 48000, 96000]) {
         assert(values.some(v => v.hz > 2000 && v.hz < 2800 && v.warning > 0), 'upper tones coincide');
     }
 }
+
+// Steady-state response of a complementary first-order 825 Hz crossover to
+// each sinusoid. Only its low output is ducked. The high output still contains
+// a real, attenuated 65 Hz component. Full-band ducking is the negative control.
+function duckedPair(rate, cut, early, split, phase) {
+    const frames = rate / 2;
+    function track(kick) {
+        return {channelcount: () => 2, framecount: () => frames, length: () => 500,
+            peek(channel, start, count) {
+                return Float64Array.from({length: count}, (_, i) => {
+                    const t = (start + i - frames) / rate + (4096 + 256) / 44100;
+                    const ms = 1000 * t;
+                    const startMs = kick ? cut - 20 : cut - early;
+                    const endMs = kick ? cut : cut + 34;
+                    const ramp = Math.max(0, Math.min(1, (ms - startMs) / 2, (endMs - ms) / 2));
+                    const gain = (1 - Math.cos(Math.PI * ramp)) / 2;
+                    const subPhase = 2 * Math.PI * 65 * t + phase;
+                    if (kick) return 0.3 * gain * Math.sin(subPhase);
+                    let bass = 0;
+                    for (const [hz, angle] of [[65, subPhase], [1800, 2 * Math.PI * 1800 * t]]) {
+                        const x = Math.sin(angle);
+                        const ratio = hz / 825;
+                        const low = (x - ratio * Math.cos(angle)) / (1 + ratio * ratio);
+                        bass += 0.5 * (split ? x - low + gain * low : gain * x);
+                    }
+                    return channel === 1 ? bass : -bass;
+                });
+            }};
+    }
+    return [track(true), track(false)];
+}
+
+for (const rate of [44100, 48000, 96000]) {
+    let reproduced = false;
+    for (const cut of [48, 58, 68]) for (const phase of [0, Math.PI / 2]) {
+        for (const split of [false, true]) for (const early of [0, 15]) {
+            const pair = duckedPair(rate, cut, early, split, phase);
+            const scores = measure(...pair);
+            if (split && cut === 58)
+                assert.equal(JSON.stringify(scores), JSON.stringify(measureFallback(...pair)));
+            const sub = scores.filter(v => v.hz >= 60 && v.hz <= 70);
+            if (split && !early && sub.some(v => v.reference >= 0.23)) reproduced = true;
+            if (!early) assert(sub.every(v => !v.warning), 'false sub warning at ' + rate);
+            if (early) assert(sub.some(v => v.warning >= 0.23), 'missed early sub at ' + rate);
+            assert(scores.every(v => v.hz < 260 || v.reference === v.warning));
+        }
+    }
+    assert(reproduced, 'reference detector must warn on split signal at ' + rate);
+}
+
+// A loud bass note gives way to a much quieter, spectrally overlapping tail.
+// Feed the same sources over successive frames so the detector sees the decay.
+// Also exercise a fresh quiet target, recovery, and a masker hitting the attack.
+const followNote = vm.runInContext(`(function (pairs) {
+    const a = makeSource({identifier: 1}), b = makeSource({identifier: 2});
+    const band = 10;
+    return pairs.map(([target, masker], i) => {
+        analyze(a, target, 0, 1000 + i * 70);
+        analyze(b, masker, 0, 1000 + i * 70);
+        const overlap = temporalOverlap(a, b);
+        return [referenceBandRisk(a, b, band, overlap), bandRisk(a, b, band, overlap)];
+    });
+})`, context);
+function levelBuffer(amplitude) {
+    return {channelcount: () => 2, framecount: () => 22050, length: () => 500,
+        peek(channel, offset, count) {
+            return Float64Array.from({length: count}, (_, i) =>
+                amplitude * Math.sin(2 * Math.PI * 65 * (i + offset) / 44100) +
+                0.14 * Math.sin(2 * Math.PI * 1800 * (i + offset) / 44100));
+        }};
+}
+const loud = levelBuffer(0.36), quiet = levelBuffer(0.018);
+const steps = followNote([[loud, loud], ...Array.from({length: 12}, () => [quiet, loud])]);
+assert(steps[0][1] >= 0.33, 'overlap on the protected attack must warn');
+assert(steps[1][0] >= 0.33 && steps[1][1] < 0.16, 'a fading tail must lose weight');
+assert(steps.at(-1)[1] >= 0.33, 'a sustained quiet target must recover');
+assert(followNote([[quiet, loud]])[0][1] >= 0.33, 'a quiet target alone sets its own reference');
 
 // Feed the packaged scheduler real ring positions, including wrap and late UI ticks.
 // A burst can start and finish between ticks. Only a mask delivered to the UI counts.

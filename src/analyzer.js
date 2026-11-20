@@ -123,6 +123,8 @@ let layoutSignature = '';
 function makeSource(item) {
     return {
         key: sourceKey(item), label: item.display_name, shown: false, context: false,
+        bassPeakDb: new Float32Array(bassBandCount).fill(floor),
+        bassTiming: new Float64Array(bassProbes.length * bassSteps),
         sliceDb: new Float32Array(slices * bands), activity: new Float64Array(size), spectrum: new Float32Array(bands).fill(floor),
         peakPower: 0, lastFrameTime: 0, held: new Float32Array(bands), expires: new Float64Array(bands), masks: new Float32Array(bands)
     };
@@ -189,6 +191,7 @@ function updateSources() {
         if (source.slot !== slot || source.remote !== isRemote) {
             source.fresh = false;
             source.peakPower = 0;
+            source.bassPeakDb.fill(floor);
         }
         source.slot = slot;
         source.remote = isRemote;
@@ -284,6 +287,7 @@ function engineRate(rate) {
     for (const source of sourceList) {
         source.fresh = false;
         source.peakPower = 0;
+        source.bassPeakDb.fill(floor);
         source.masks.fill(0);
         source.expires.fill(0);
     }
@@ -366,8 +370,9 @@ function analyzeFrame() {
                 if (!source.fresh || source === target || source.context) continue;
                 const overlap = temporalOverlap(target, source);
                 if (overlap < warningThreshold) continue;
+                const coincidence = bassCoincidence(target, source);
                 for (let b = 0; b < warningBandCount; b++)
-                    source.masks[b] = Math.max(source.masks[b], bandRisk(target, source, b, overlap));
+                    source.masks[b] = Math.max(source.masks[b], bandRisk(target, source, b, overlap, coincidence));
             }
         }
         if (hold && lags.length && target?.fresh) {
@@ -440,6 +445,8 @@ function monitorOpened() {
     monitor = scope.patcher.getnamed('monitor').subpatcher();
     layoutSignature = '';
     captureRequested = true;
+    scope.patcher.getnamed('poll').message(1);
+    scope.patcher.getnamed('routingClock').message(1);
     scope.patcher.getnamed('clock').message(1);
     updateSources();
     updateCapture();
@@ -453,6 +460,8 @@ function monitorClosed() {
     audioCursor = null;
     captureWarningUntil = 0;
     captureRequested = false;
+    scope.patcher.getnamed('poll').message(0);
+    scope.patcher.getnamed('routingClock').message(0);
     for (const source of sourceList) source.fresh = false;
     scope.patcher.getnamed('clock').message(0);
     updateSources();

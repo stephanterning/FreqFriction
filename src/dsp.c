@@ -35,3 +35,31 @@ void fftpower(const double *input, const double *window, const int *reversed,
     for (int k = 0; k < length / 2; ++k)
         power[k] += real[k] * real[k] + imag[k] * imag[k];
 }
+
+void decimate(const double *input, double *samples, int count, int factor) {
+    double previous_tail = 0;
+    for (int i = 0; i < count; i++) {
+        double head = 0, sum = 0;
+        for (int k = 0; k < factor; k++) {
+            sum += input[i * factor + k];
+            head += sum;
+        }
+        samples[i] = (previous_tail + head) / (factor * factor);
+        previous_tail = sum * factor - head;
+    }
+}
+
+void probepower(const double *samples, int count, const double *cosine,
+                const double *sine, int half, int hop, double *power, int steps) {
+    for (int t = 0; t < steps; t++) {
+        int mid = t * hop + hop / 2;
+        int first = mid < half ? -mid : -half;
+        int last = count - 1 - mid < half ? count - 1 - mid : half;
+        double re = 0, im = 0;
+        for (int k = first; k <= last; k++) {
+            re += samples[mid + k] * cosine[k + half];
+            im += samples[mid + k] * sine[k + half];
+        }
+        power[t] += re * re + im * im;
+    }
+}

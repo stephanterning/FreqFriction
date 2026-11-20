@@ -17,6 +17,7 @@ ROUTING = (ROOT / "routing.js").read_text()
 if len(sys.argv) == 3 and sys.argv[1] == "--dsp":
     subprocess.run([sys.argv[2], "cc", "-target", "wasm32-freestanding", "-O3",
                     "-nostdlib", "-ffp-contract=off", "-Wl,--no-entry", "-Wl,--strip-all",
+                    "-Wl,--export=decimate", "-Wl,--export=probepower",
                     "-Wl,--export=resample", "-Wl,--export=fftpower", "-Wl,--export=__heap_base",
                     "dsp.c", "-o", "dsp.wasm"], cwd=ROOT, check=True)
 
@@ -61,7 +62,8 @@ def input_bank(patch, helper):
     # Keep each Live input bound to a separate stereo memory and synchronize the writers.
     prefix = "#0-ff-helper" if helper else "#0-ff-main"
     patch.obj("capture", "int", 230, 330, varname="capture")
-    patch.obj("start", "loadmess 1", 485, 235)
+    if helper:
+        patch.obj("start", "loadmess 1", 485, 235)
     patch.wire("inputs", "through")
     patch.wire("inputs", "through", 1, 1)
     for slot in range(BANK_SIZE):
@@ -90,19 +92,21 @@ def input_bank(patch, helper):
     patch.obj("buf-name", f"loadmess buffername {prefix}", 610, 330)
     patch.obj("live-ready", "live.thisdevice", 505, 395)
     patch.obj("init", "deferlow", 505, 425)
-    patch.obj("poll", "qmetro 1000", 650, 395)
+    patch.obj("poll", "qmetro 1000", 650, 395, **({} if helper else {"varname": "poll"}))
     patch.message("device-path", "path this_device", 570, 470)
     patch.obj("device-id", "live.path", 720, 470)
     patch.obj("bind-device", "prepend bindDevice", 720, 505)
-    patch.obj("routing-clock", "qmetro 65", 350, 440)
+    patch.obj("routing-clock", "qmetro 65", 350, 440, **({} if helper else {"varname": "routingClock"}))
     patch.message("routing-update", "updateRouting", 350, 480)
     patch.wire("live-ready", "init")
-    patch.wire("init", "device-path")
-    patch.wire("start", "poll")
+    if helper:
+        patch.wire("init", "device-path")
+        patch.wire("start", "poll")
     patch.wire("poll", "device-path")
     patch.wire("device-path", "device-id")
     patch.wire("device-id", "bind-device")
-    patch.wire("start", "routing-clock")
+    if helper:
+        patch.wire("start", "routing-clock")
     patch.wire("routing-clock", "routing-update")
     for item in ("head", "bind-device", "buf-name", "routing-update"):
         patch.wire(item, "plot")

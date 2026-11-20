@@ -122,6 +122,122 @@ function measureBands(fft, rate, left, right, offset, output, index) {
 
 // Keep both FFTs on the 44.1 kHz time/frequency grid used for calibration.
 const analysisRate = 44100;
+// A short, frequency-selective energy envelope checks when the low notes sound.
+// The long FFT still determines which display bands can warn. Two overlapping
+// probes keep an upper harmonic from supplying timing evidence for a sub note.
+const bassHop = 64;
+const bassSteps = size / bassHop;
+const bassDecimation = 16;
+const bassProbes = [65, 130].map(frequency => {
+    const half = Math.round(analysisRate / (frequency * bassDecimation));
+    const cosine = [], sine = [], window = [];
+    let dc = 0, total = 0;
+    for (let k = -half; k <= half; k++) {
+        const w = 0.5 + 0.5 * Math.cos(Math.PI * k / half);
+        const phase = 2 * Math.PI * frequency * k * bassDecimation / analysisRate;
+        window.push(w);
+        cosine.push(w * Math.cos(phase));
+        sine.push(w * Math.sin(phase));
+        dc += cosine[cosine.length - 1];
+        total += w;
+    }
+    for (let j = 0; j < cosine.length; j++) cosine[j] -= window[j] * dc / total;
+    return {half, cosine, sine};
+});
+const bassWeights = Array.from({length: bands}, (_, b) => {
+    const position = Math.max(0, Math.log2(hz(b) / 65));
+    return [Math.max(0, 1 - position), Math.max(0, 1 - Math.abs(position - 1))];
+});
+const bassSamples = new Float64Array(size / bassDecimation);
+
+const bassBandCount = bassWeights.findIndex(([low, upper]) => low + upper === 0);
+// A fading protected note can occupy the same band as a much louder new note.
+// Track its recent level locally. A sustained quiet note sets its own reference.
+const bassPeakReleaseDbPerSecond = 48;
+const bassTailAllowanceDb = 3;
+
+const bassKernelSize = bassProbes[0].cosine.length;
+const bassNative = dspWorkspace([
+    ['input', Float64Array, size], ['samples', Float64Array, bassSamples.length],
+    ['cosine', Float64Array, bassKernelSize * bassProbes.length],
+    ['sine', Float64Array, bassKernelSize * bassProbes.length],
+    ['power', Float64Array, bassSteps * bassProbes.length]
+]);
+if (bassNative) bassProbes.forEach((probe, i) => {
+    bassNative.cosine.set(probe.cosine, i * bassKernelSize);
+    bassNative.sine.set(probe.sine, i * bassKernelSize);
+});
+
+// Triangular low-pass before decimation (two box filters). Keep both stereo
+// channels' power, including opposite polarity and hard-panned sources.
+function addBassPower(input, envelopes) {
+    if (bassNative) {
+        const {input: block, samples, exports, cosine, sine} = bassNative;
+        block.set(input);
+        exports.decimate(block.byteOffset, samples.byteOffset, samples.length, bassDecimation);
+        for (let p = 0; p < bassProbes.length; p++) {
+            const offset = p * bassKernelSize * Float64Array.BYTES_PER_ELEMENT;
+            exports.probepower(samples.byteOffset, samples.length, cosine.byteOffset + offset,
+                sine.byteOffset + offset, bassProbes[p].half, bassHop / bassDecimation,
+                envelopes.byteOffset + p * bassSteps * Float64Array.BYTES_PER_ELEMENT, bassSteps);
+        }
+        return;
+    }
+    let previousTail = 0;
+    for (let i = 0; i < bassSamples.length; i++) {
+        let head = 0, sum = 0;
+        for (let k = 0; k < bassDecimation; k++) {
+            const sample = input[i * bassDecimation + k];
+            sum += sample;
+            head += sum;
+        }
+        bassSamples[i] = (previousTail + head) / (bassDecimation * bassDecimation);
+        previousTail = sum * bassDecimation - head;
+    }
+    for (let p = 0; p < bassProbes.length; p++) {
+        const {half, cosine, sine} = bassProbes[p];
+        for (let t = 0; t < bassSteps; t++) {
+            const mid = (t + 0.5) * bassHop / bassDecimation;
+            let re = 0, im = 0;
+            const last = Math.min(half, bassSamples.length - 1 - mid);
+            for (let k = Math.max(-half, -mid); k <= last; k++) {
+                const sample = bassSamples[mid + k];
+                re += sample * cosine[k + half];
+                im += sample * sine[k + half];
+            }
+            envelopes[p * bassSteps + t] += re * re + im * im;
+        }
+    }
+}
+
+function measureBassTiming(source, left, right) {
+    const envelopes = bassNative?.power ?? source.bassTiming;
+    envelopes.fill(0);
+    addBassPower(left, envelopes);
+    addBassPower(right, envelopes);
+    for (let p = 0; p < bassProbes.length; p++) {
+        const offset = p * bassSteps;
+        let energy = 0;
+        for (let t = 0; t < bassSteps; t++) {
+            envelopes[offset + t] *= windowFn[t * bassHop + bassHop / 2] ** 2;
+            energy += envelopes[offset + t];
+        }
+        if (energy > 0) for (let t = 0; t < bassSteps; t++) envelopes[offset + t] /= energy;
+    }
+    if (bassNative) source.bassTiming.set(envelopes);
+}
+
+function bassCoincidence(first, second) {
+    return bassProbes.map((_, p) => {
+        let common = 0;
+        for (let i = p * bassSteps; i < (p + 1) * bassSteps; i++)
+            common += Math.min(first.bassTiming[i], second.bassTiming[i]);
+        // Prototype calibration: retain full credit once half the normalized
+        // energy profiles coincide. A hand-off gets proportionally less.
+        return Math.min(1, 2 * common);
+    });
+}
+
 let lastFormat, engineSampleRate = 0;
 function bufferRate(buffer) {
     return engineSampleRate || buffer.framecount() * 1000 / buffer.length();
@@ -226,13 +342,15 @@ function analyze(source, buffer, phase, now, lag = 0) {
         samplePower[n] = Math.max(0, samplePower[n] - gate) * windowFn[n] ** 2;
         source.energy += samplePower[n];
     }
-    if (framePeak <= 1e-12) {
-        source.spectrum.fill(floor);
-        return true;
+    if (framePeak <= 1e-12) source.spectrum.fill(floor);
+    else measureBands(displayFFT, rate, left, right, 0, source.spectrum, 0);
+    for (let b = 0; b < bassBandCount; b++) {
+        source.bassPeakDb[b] = Math.max(source.spectrum[b],
+            source.bassPeakDb[b] - elapsed * bassPeakReleaseDbPerSecond);
     }
-    measureBands(displayFFT, rate, left, right, 0, source.spectrum, 0);
     // Inactive frames cannot enter the overlap comparison.
     if (source.energy === 0) return true;
+    measureBassTiming(source, left, right);
     for (let i = 0; i < slices; i++)
         measureBands(overlapFFT, rate, left, right, i * overlapFFT.length / 2, source.sliceDb, i * bands);
     return true;
@@ -254,7 +372,7 @@ function risk(target, other) {
 
 // The long FFT localizes a warning in frequency. Short, aligned windows decide
 // whether both sources actually contributed energy there at the same time.
-function bandRisk(first, second, band, overlap) {
+function referenceBandRisk(first, second, band, overlap) {
     if (band >= warningBandCount) return 0;
     const full = risk(first.spectrum[band], second.spectrum[band]);
     if (full * overlap < warningThreshold) return 0;
@@ -273,5 +391,17 @@ function bandRisk(first, second, band, overlap) {
         shared += simultaneous * risk(target, other);
     }
     const score = Math.min(full * overlap, shared / targetEnergy);
+    return score >= warningThreshold ? score : 0;
+}
+
+function bandRisk(first, second, band, overlap, coincidence) {
+    const referenceScore = referenceBandRisk(first, second, band, overlap);
+    if (!referenceScore) return 0;
+    const [low, upper] = bassWeights[band];
+    if (!(low + upper)) return referenceScore;
+    const factors = coincidence ?? bassCoincidence(first, second);
+    const fadeDb = Math.max(0, first.bassPeakDb[band] - first.spectrum[band] - bassTailAllowanceDb);
+    const prominence = Math.pow(10, -fadeDb / 20);
+    const score = referenceScore * (1 - low - upper + prominence * (low * factors[0] + upper * factors[1]));
     return score >= warningThreshold ? score : 0;
 }
